@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+
+# Inspired by
+# - https://github.com/Scalingo/nodejs-buildpack/blob/429b9776d8b0f34f775a10caa4eae46677ead0af/bin/compile
+# - https://github.com/oven-sh/setup-bun
+
+set -o errexit
+set -o pipefail
+
+[ -n "$BUILDPACK_DEBUG" ] && set -x
+[ "$BUILDPACK_XTRACE" ] && set -o xtrace
+
+unset GIT_DIR
+
+BUILD_DIR=${1:-}
+CACHE_DIR=${2:-}
+BP_DIR=$(cd "$(dirname "${0:-}")"; cd ..; pwd)
+
+info()   { echo "       $*" || true; }
+error()  { echo " !     $*" >&2 || true; echo "" || true; }
+header() { echo ""; echo "-----> $*" || true; }
+
+read_package_json() {
+  local key="$1"
+  # shellcheck disable=SC2002
+  cat "$BUILD_DIR/package.json" | jq -c -M --raw-output "$key // empty" 2>/dev/null || true
+}
+
+# Resolve bun version from package.json, following the same priority as setup-bun:
+#   1. packageManager field (e.g. "bun@1.1.0")
+#   2. engines.bun field
+#   3. latest
+resolve_bun_version() {
+  if [ ! -f "$BUILD_DIR/package.json" ]; then
+    echo "latest"
+    return
+  fi
+
+  local package_manager version
+
+  # 1. packageManager: "bun@x.y.z"
+  package_manager=$(read_package_json ".packageManager")
+  if [[ "$package_manager" == bun@* ]]; then
+    echo "${package_manager#bun@}"
+    return
+  fi
+
+  # 2. engines.bun
+  version=$(read_package_json ".engines.bun")
+  if [ -n "$version" ]; then
+    echo "$version"
+    return
+  fi
+
+  # 3. fallback
+  echo "latest"
+}
+
+write_profile() {
+  mkdir -p "$BUILD_DIR/.profile.d"
+  cp "$BP_DIR"/profile/* "$BUILD_DIR/.profile.d/"
+}
+
+write_profile_git() {
+  mkdir -p "$BUILD_DIR/.profile.d"
+  echo "export NODE_ENV=production" > "$BUILD_DIR/.profile.d/node.sh"
+  echo "export GIT_SHA=$SOURCE_VERSION" > "$BUILD_DIR/.profile.d/git.sh"
+}
+
+#
+
+header "Creating runtime environment"
+
+write_profile
+write_profile_git
+
+for file in "$BP_DIR"/profile/*.sh; do
+  # shellcheck source=/dev/null
+  source "$file"
+done
+
+#
+
+NODE_VERSION=$(read_package_json ".engines.node")
+
+if [ -n "$NODE_VERSION" ]; then
+  header "Installing node $NODE_VERSION"
+  curl -fsSL https://raw.githubusercontent.com/tj/n/master/bin/n | bash -s "$NODE_VERSION"
+fi
+
+#
+
+BUN_VERSION=$(resolve_bun_version)
+header "Installing bun $BUN_VERSION"
+
+if [ "$BUN_VERSION" = "latest" ]; then
+  info "No version pinned — installing latest bun"
+  info "Pin a version via package.json packageManager or engines.bun to ensure reproducible builds"
+  curl -fsSL https://bun.sh/install | bash
+else
+  info "Installing bun $BUN_VERSION"
+  curl -fsSL https://bun.sh/install | bash -s "bun-v$BUN_VERSION"
+fi
+
+#
+
+cd "$BUILD_DIR"
+
+header "Installing dependencies"
+bun install --cache-dir "$CACHE_DIR" --frozen-lockfile
+
+header "Build"
+bun run build
+
+header "Remove development dependencies"
+rm -rf node_modules
+
+header "Installing production dependencies"
+bun install --cache-dir "$CACHE_DIR" --frozen-lockfile --production
+
+header "Remove package manager cache"
+bun pm cache rm
